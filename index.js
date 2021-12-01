@@ -1,4 +1,5 @@
 const net = require('net');
+const fs = require('fs');
 const port = 12345;
 const host = '127.0.0.1';
 
@@ -14,13 +15,16 @@ server.on('connection', function (sock) {
   sockets.push(sock);
 
   sock.on('data', function (data) {
-    console.log('DATA ' + sock.remoteAddress + ': ' + data);
+    if (data == 'sendingPDF') {
+      sock.pipe(fs.createWriteStream('./report.pdf'));
+    }
+    // console.log('DATA ' + sock.remoteAddress + ': ' + data);
     // Write the data back to all the connected, the client will receive it as data from the server
-    sockets.forEach(function (sock, index, array) {
-      sock.write(
-        sock.remoteAddress + ':' + sock.remotePort + ' said ' + data + '\n'
-      );
-    });
+    // sockets.forEach(function (sock, index, array) {
+    //   sock.write(
+    //     sock.remoteAddress + ':' + sock.remotePort + ' said ' + buffer + '\n'
+    //   );
+    // });
   });
 
   // Add a 'close' event handler to this instance of socket
