@@ -11,7 +11,10 @@ const server = net.createServer({ allowHalfOpen: true });
 
 let sockets = [];
 
+const RESULT_FILENAME = 'verification-result.txt';
+const CERTIFICATE_PATH = './my-certificate.cert';
 const DELIMITER = '\n\n\n\n\n***************';
+const RECEIVED_ROOT = './_RECEIVED/';
 
 server.on('connection', (socket) => {
   let body = '';
@@ -24,66 +27,56 @@ server.on('connection', (socket) => {
   });
 
   socket.on('end', () => {
-    console.log(socket.bytesRead);
+    // Parse data received from client (document and signature)
     const result = body.toString('binary').split(DELIMITER);
+    const signatureBytes = Number(result[0]);
+    let signatureFilename = result[1];
+    const documentBytes = Number(result[2]);
+    const documentFilename = result[3];
+    signatureFilename = documentFilename + '_' + signatureFilename;
+    const signatureBuffer = Buffer.alloc(
+      signatureBytes,
+      Buffer.from(result[4], 'binary')
+    );
+    const documentBuffer = Buffer.alloc(
+      documentBytes,
+      Buffer.from(result[5], 'binary')
+    );
 
-    const file1bytes = Number(result[0]);
-    const file1Name = result[1];
-    const file2bytes = Number(result[2]);
-    const file2Name = result[3];
-    const buffer1 = Buffer.alloc(file1bytes, Buffer.from(result[4], 'binary'));
-    const buffer2 = Buffer.alloc(file2bytes, Buffer.from(result[5], 'binary'));
-    fs.writeFileSync('./' + file1Name, buffer1);
-    fs.writeFileSync('./' + file2Name, buffer2);
+    // Write document and signature to files
+    fs.writeFileSync(RECEIVED_ROOT + signatureFilename, signatureBuffer);
+    fs.writeFileSync(RECEIVED_ROOT + documentFilename, documentBuffer);
 
+    // Calculate document hash
     const hash = crypto.createHash('sha512');
-    const document = fs.readFileSync('./' + file2Name);
+    const document = fs.readFileSync(RECEIVED_ROOT + documentFilename);
     hash.update(document);
+
+    // Parse certificate to get author information
+    const certificate = fs.readFileSync(CERTIFICATE_PATH);
+    const x509 = new crypto.X509Certificate(certificate);
+    const author = parseCertificate(certificate);
+
+    // Compare document hash with decrypted signature & verify certificate matches public key, then stream result to client
     const publicKey = crypto.createPublicKey(
       fs.readFileSync('./public_key.pem')
     );
-    const signature = fs.readFileSync('./signature.bin');
-    const certificate = fs.readFileSync('./my-certificate.cert');
-    const x509 = new crypto.X509Certificate(certificate);
-    const parsedCertificate = x509parse.parseCert(certificate);
-    const author =
-      '\n\n****************************************\n\n' +
-      'Author details:\n\n' +
-      'Organization name: ' +
-      parsedCertificate.issuer.organizationName +
-      '\n' +
-      'Common name: ' +
-      parsedCertificate.issuer.commonName +
-      '\n' +
-      'Country: ' +
-      parsedCertificate.issuer.countryName +
-      '\n' +
-      'City: ' +
-      parsedCertificate.issuer.localityName;
-
-    const res = crypto.publicDecrypt(
+    const signature = fs.readFileSync(RECEIVED_ROOT + signatureFilename);
+    const decryptedSignature = crypto.publicDecrypt(
       publicKey,
       Buffer.from(signature, 'binary')
     );
-    const resFile = 'verification-result.txt';
     socket.write(
       Buffer.from('sending Verification Result' + DELIMITER),
       'binary'
     );
-    if (res.compare(hash.digest()) == 0 && x509.verify(publicKey)) {
-      const buffer = Buffer.from('Signature is VALID.' + author);
-      socket.write(Buffer.from(buffer.byteLength + DELIMITER), 'binary');
-      socket.write(Buffer.from(resFile + DELIMITER), 'binary');
-      Readable.from(buffer).pipe(socket);
+    if (
+      decryptedSignature.compare(hash.digest()) == 0 &&
+      x509.verify(publicKey)
+    ) {
+      streamToClient(socket, 'Signature is VALID.' + author);
     } else {
-      fs.writeFileSync(resFile, 'Signature is NOT VALID.');
-      socket.write(
-        Buffer.from(fs.statSync('./' + resFile).size + DELIMITER),
-        'binary'
-      );
-      socket.write(Buffer.from(resFile + DELIMITER), 'binary');
-      const streamVerification = fs.createReadStream('./' + resFile);
-      streamVerification.on('open', () => streamVerification.pipe(socket));
+      streamToClient(socket, 'Signature is NOT VALID.');
     }
 
     disconnect(socket);
@@ -93,6 +86,32 @@ server.on('connection', (socket) => {
 server.listen(port, host, () => {
   console.log('TCP Server is running on port ' + port + '.');
 });
+
+function parseCertificate(certificate) {
+  const parsedCertificate = x509parse.parseCert(certificate);
+  return (
+    '\n\n****************************************\n\n' +
+    'Author details:\n\n' +
+    'Organization name: ' +
+    parsedCertificate.issuer.organizationName +
+    '\n' +
+    'Common name: ' +
+    parsedCertificate.issuer.commonName +
+    '\n' +
+    'Country: ' +
+    parsedCertificate.issuer.countryName +
+    '\n' +
+    'City: ' +
+    parsedCertificate.issuer.localityName
+  );
+}
+
+function streamToClient(socket, data) {
+  const buffer = Buffer.from(data);
+  socket.write(Buffer.from(buffer.byteLength + DELIMITER), 'binary');
+  socket.write(Buffer.from(RESULT_FILENAME + DELIMITER), 'binary');
+  Readable.from(buffer).pipe(socket);
+}
 
 function disconnect(socket) {
   let index = sockets.findIndex(function (o) {
