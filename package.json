@@ -5,5 +5,8 @@
   "scripts": {
     "start": "node index.js"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "x509.js": "^1.0.0"
+  }
 }
