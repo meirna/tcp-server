@@ -4,22 +4,24 @@ const service = require('./service');
 const port = 12345;
 const host = '127.0.0.1';
 
-const server = net.createServer({ allowHalfOpen: true });
+const server = net.createServer();
 
 let sockets = [];
 
 server.on('connection', (socket) => {
-  let body = '';
+  const requestBody = [];
+
   sockets.push(socket);
   console.log('CONNECTED: ' + socket.remoteAddress + ':' + socket.remotePort);
-  socket.write('CONNECTED: ' + socket.remoteAddress + service.delimiter);
 
   socket.on('data', (data) => {
-    body += data;
+    requestBody.push(data);
   });
 
   socket.on('end', () => {
-    service.processRequest(socket, body);
+    service.processRequest(requestBody);
+
+    // service.sendResponse(socket);
 
     disconnect(socket);
   });

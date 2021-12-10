@@ -1,72 +1,87 @@
 const fs = require('fs');
 const crypto = require('crypto');
-const { Readable } = require('stream');
+const { Readable, Writable } = require('stream');
 const x509parse = require('x509.js');
 
-const RESULT_FILENAME = 'verification-result.txt';
-const CERTIFICATE_PATH = './my-certificate.cert';
-const DELIMITER = '\n\n\n\n\n***************';
 const RECEIVED_ROOT = './_RECEIVED/';
+const SIGNATURE_FILENAME_APPEND = '_signature.bin';
+const VERIFICATION_RESULT_FILENAME = 'verification-result.txt';
+const CIPHER_FILENAME = 'cipher.bin';
+const CERTIFICATE_PATH = './my-certificate.cert';
+const PUBLIC_KEY_PATH = './public_key.pem';
 
 module.exports = {
-  delimiter: DELIMITER,
   processRequest: processRequest,
+  sendResponse: sendResponse,
 };
 
-function processRequest(socket, body) {
-  // Parse data received from client (signature and document)
-  const result = body.toString('binary').split(DELIMITER);
-  const signatureBytes = Number(result[0]);
-  let signatureFilename = result[1];
-  const documentBytes = Number(result[2]);
-  const documentFilename = result[3];
-  signatureFilename = documentFilename + '_' + signatureFilename;
-  const signatureBuffer = Buffer.alloc(
-    signatureBytes,
-    Buffer.from(result[4], 'binary')
-  );
-  const documentBuffer = Buffer.alloc(
-    documentBytes,
-    Buffer.from(result[5], 'binary')
-  );
+function processRequest(body) {
+  const documentFilename = parseRequest(body);
 
-  // Write document and signature to files -- for demonstration purposes!
-  fs.writeFileSync(RECEIVED_ROOT + signatureFilename, signatureBuffer);
-  fs.writeFileSync(RECEIVED_ROOT + documentFilename, documentBuffer);
-
-  // Calculate document hash
-  const hash = crypto.createHash('sha512');
-  const document = fs.readFileSync(RECEIVED_ROOT + documentFilename);
-  hash.update(document);
-
-  // Parse certificate to get author information
+  // Parse certificate
   const certificate = fs.readFileSync(CERTIFICATE_PATH);
   const x509 = new crypto.X509Certificate(certificate);
-  const author = parseCertificate(certificate);
+  const authorDetails = getCertificateAuthorDetails(certificate);
 
-  // Compare document hash with decrypted signature & verify certificate matches public key, then stream result to client
-  const publicKey = crypto.createPublicKey(fs.readFileSync('./public_key.pem'));
-  const signature = fs.readFileSync(RECEIVED_ROOT + signatureFilename);
-  const decryptedSignature = crypto.publicDecrypt(
-    publicKey,
-    Buffer.from(signature, 'binary')
-  );
-  socket.write(
-    Buffer.from('sending Verification Result' + DELIMITER),
-    'binary'
-  );
-  if (
-    decryptedSignature.compare(hash.digest()) == 0 &&
-    x509.verify(publicKey)
-  ) {
-    streamToClient(socket, 'Signature is VALID.' + author);
+  if (verifySignature(documentFilename, x509)) {
+    fs.writeFileSync(
+      VERIFICATION_RESULT_FILENAME,
+      'Signature is VALID.' + authorDetails
+    );
   } else {
-    streamToClient(socket, 'Signature is NOT VALID.');
+    fs.writeFileSync(VERIFICATION_RESULT_FILENAME, 'Signature is NOT VALID.');
   }
 }
 
-function parseCertificate(certificate) {
+function parseRequest(body) {
+  const received = Buffer.concat(body);
+
+  // HEADER:
+  // 1. Signature bytes - UInt16Array(1) - 2 bytes - offset 0
+  // 2. Document bytes - UInt32Array(1) - 4 bytes - offset 2
+  // 3. Document filename bytes - UInt16Array(1) - 2 bytes - offset 6
+  const signatureBytesOffset = 0;
+  const documentBytesOffset = 2;
+  const documentFilenameBytesOffset = 6;
+  const documentFilenameOffset = 8;
+
+  const signatureBytes = received.readUInt16LE(signatureBytesOffset);
+  const documentBytes = received.readUInt32LE(documentBytesOffset);
+  const documentFilenameBytes = received.readUInt16LE(
+    documentFilenameBytesOffset
+  );
+
+  // PAYLOAD (streams):
+  // 4. Document filename
+  // 5. Signature
+  // 6. Document
+  const documentFilename = received
+    .slice(
+      documentFilenameOffset,
+      documentFilenameOffset + documentFilenameBytes
+    )
+    .toString();
+  const signature = received.slice(
+    documentFilenameOffset + documentFilenameBytes,
+    documentFilenameOffset + documentFilenameBytes + signatureBytes
+  );
+  const document = received.slice(
+    documentFilenameOffset + documentFilenameBytes + signatureBytes
+  );
+
+  // Write document and signature to files -- for demonstration purposes!
+  fs.writeFileSync(
+    RECEIVED_ROOT + documentFilename + SIGNATURE_FILENAME_APPEND,
+    signature
+  );
+  fs.writeFileSync(RECEIVED_ROOT + documentFilename, document);
+
+  return documentFilename;
+}
+
+function getCertificateAuthorDetails(certificate) {
   const parsedCertificate = x509parse.parseCert(certificate);
+
   return (
     '\n\n****************************************\n\n' +
     'Author details:\n\n' +
@@ -84,9 +99,41 @@ function parseCertificate(certificate) {
   );
 }
 
+function verifySignature(documentFilename, x509) {
+  // Calculate document hash
+  const document = fs.readFileSync(RECEIVED_ROOT + documentFilename);
+  const hash = crypto.createHash('sha512');
+  hash.update(document);
+
+  // Decrypt signature with public key
+  const publicKey = crypto.createPublicKey(fs.readFileSync(PUBLIC_KEY_PATH));
+  const signature = fs.readFileSync(
+    RECEIVED_ROOT + documentFilename + SIGNATURE_FILENAME_APPEND
+  );
+  const decryptedSignature = crypto.publicDecrypt(publicKey, signature);
+
+  // Verify document hash equals decryped signature &&
+  // verify certificate contains public key
+  return (
+    decryptedSignature.compare(hash.digest()) == 0 && x509.verify(publicKey)
+  );
+}
+
+function sendResponse() {}
+
 function streamToClient(socket, data) {
+  // const key = crypto.randomBytes(24);
+  // const initializationVector = crypto.randomBytes(64);
+  // const cipher = crypto.createCipheriv(
+  //   'aes-192-gcm',
+  //   key,
+  //   initializationVector
+  // );
+  // const publicKey = crypto.createPublicKey(fs.readFileSync('./public_key.pem'));
+  // const encryptedCipher = crypto.publicEncrypt(publicKey, cipher.final());
+
   const buffer = Buffer.from(data);
   socket.write(Buffer.from(buffer.byteLength + DELIMITER), 'binary');
-  socket.write(Buffer.from(RESULT_FILENAME + DELIMITER), 'binary');
+  socket.write(Buffer.from(VERIFICATION_RESULT_FILENAME + DELIMITER), 'binary');
   Readable.from(buffer).pipe(socket);
 }
