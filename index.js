@@ -4,7 +4,7 @@ const service = require('./service');
 const port = 12345;
 const host = '127.0.0.1';
 
-const server = net.createServer();
+const server = net.createServer({ allowHalfOpen: true });
 
 let sockets = [];
 
@@ -21,7 +21,7 @@ server.on('connection', (socket) => {
   socket.on('end', () => {
     service.processRequest(requestBody);
 
-    // service.sendResponse(socket);
+    service.sendResponse(socket);
 
     disconnect(socket);
   });

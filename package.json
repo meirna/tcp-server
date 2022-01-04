@@ -7,6 +7,7 @@
   },
   "license": "MIT",
   "dependencies": {
+    "multistream": "^4.1.0",
     "x509.js": "^1.0.0"
   }
 }
