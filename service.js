@@ -1,46 +1,37 @@
 const fs = require('fs');
+const util = require('util');
 const crypto = require('crypto');
-const { Readable, Writable } = require('stream');
+const { Readable } = require('stream');
+const { Socket } = require('net');
 const x509parse = require('x509.js');
 const MultiStream = require('multistream');
 
 const RECEIVED_ROOT = './_RECEIVED/';
 const SIGNATURE_FILENAME_APPEND = '_signature.bin';
 const VERIFICATION_RESULT_FILENAME = 'verification-result.txt';
-const CIPHER_FILENAME = 'cipher.bin';
 const CERTIFICATE_PATH = './my-certificate.cert';
-const PUBLIC_KEY_PATH = './public_key.pem';
 
 module.exports = {
   processRequest: processRequest,
   sendResponse: sendResponse,
 };
 
-function processRequest(body) {
-  const documentFilename = parseRequest(body);
-
-  // Parse author's certificate
-  const certificate = fs.readFileSync(CERTIFICATE_PATH);
-  const x509 = new crypto.X509Certificate(certificate);
-  const authorDetails = getCertificateAuthorDetails(certificate);
-
-  if (verifySignature(documentFilename, x509)) {
-    fs.writeFileSync(
-      VERIFICATION_RESULT_FILENAME,
-      'Signature is VALID.' + authorDetails
-    );
-  } else {
-    fs.writeFileSync(VERIFICATION_RESULT_FILENAME, 'Signature is NOT VALID.');
-  }
-}
-
+/**
+ * Request Header:
+ * 1. Signature bytes - UInt16(1) - 2 bytes - offset 0
+ * 2. Document bytes - UInt32(1) - 4 bytes - offset 2
+ * 3. Document filename bytes - UInt16(1) - 2 bytes - offset 6
+ *
+ * Request Payload (streams):
+ * 4. Document filename
+ * 5. Signature
+ * 6. Document
+ * @param {Buffer[]} body
+ * @returns documentFilename
+ */
 function parseRequest(body) {
   const received = Buffer.concat(body);
 
-  // HEADER:
-  // 1. Signature bytes - UInt16Array(1) - 2 bytes - offset 0
-  // 2. Document bytes - UInt32Array(1) - 4 bytes - offset 2
-  // 3. Document filename bytes - UInt16Array(1) - 2 bytes - offset 6
   const signatureBytesOffset = 0;
   const documentBytesOffset = 2;
   const documentFilenameBytesOffset = 6;
@@ -52,10 +43,6 @@ function parseRequest(body) {
     documentFilenameBytesOffset
   );
 
-  // PAYLOAD (streams):
-  // 4. Document filename
-  // 5. Signature
-  // 6. Document
   const documentFilename = received
     .slice(
       documentFilenameOffset,
@@ -80,6 +67,24 @@ function parseRequest(body) {
   return documentFilename;
 }
 
+function processRequest(body) {
+  const documentFilename = parseRequest(body);
+
+  // Parse author's certificate
+  const certificate = fs.readFileSync(CERTIFICATE_PATH);
+  const x509 = new crypto.X509Certificate(certificate);
+  const authorDetails = getCertificateAuthorDetails(certificate);
+
+  if (verifySignature(documentFilename, x509)) {
+    fs.writeFileSync(
+      VERIFICATION_RESULT_FILENAME,
+      'Signature is VALID.' + authorDetails
+    );
+  } else {
+    fs.writeFileSync(VERIFICATION_RESULT_FILENAME, 'Signature is NOT VALID.');
+  }
+}
+
 function getCertificateAuthorDetails(certificate) {
   const parsedCertificate = x509parse.parseCert(certificate);
 
@@ -89,7 +94,7 @@ function getCertificateAuthorDetails(certificate) {
     'Organization name: ' +
     parsedCertificate.issuer.organizationName +
     '\n' +
-    'Common name: ' +
+    'Email/common name: ' +
     parsedCertificate.issuer.commonName +
     '\n' +
     'Country: ' +
@@ -106,89 +111,123 @@ function verifySignature(documentFilename, x509) {
   const hash = crypto.createHash('sha512');
   hash.update(document);
 
-  // Decrypt signature with author's public key
-  const publicKey = crypto.createPublicKey(fs.readFileSync(PUBLIC_KEY_PATH));
+  // Decrypt signature with author's public key obtained from certificate
   const signature = fs.readFileSync(
     RECEIVED_ROOT + documentFilename + SIGNATURE_FILENAME_APPEND
   );
-  const decryptedSignature = crypto.publicDecrypt(publicKey, signature);
+  const decryptedSignature = crypto.publicDecrypt(x509.publicKey, signature);
 
-  // Verify document hash equals decryped signature &&
-  // verify certificate contains author's public key
-  return (
-    decryptedSignature.compare(hash.digest()) == 0 && x509.verify(publicKey)
-  );
+  // Verify document hash equals decryped signature
+  return decryptedSignature.compare(hash.digest()) == 0;
 }
 
+/**
+ * Steps:
+ * 1. Generate AES-128 key
+ * 2. Export AES-128 key
+ * 3. Create IV (randomBytes(16))
+ * 4. Create cipher with AES-128 key+IV
+ * 5. encryptedMessage = cipher.update(message)
+ * 6. cipher.final()
+ * 7. Get authTag from finalized cipher
+ * 8. Get public key from certificate
+ * 9. Encrypt AES-128 key with public key
+ * 10. Send to client: encryptedMessage, authTag, encrypted AES-128 key, IV
+ * @param {Socket} socket
+ */
 function sendResponse(socket) {
-  // Generate cipher (symmetric key)
-  // const key = crypto.randomBytes(24);
-  const initializationVector = crypto.randomBytes(64);
-  // const cipher = crypto.createCipheriv(
-  //   'aes-192-gcm',
-  //   key,
-  //   initializationVector
-  // );
+  util
+    .promisify(crypto.generateKey)('aes', { length: 128 })
+    .then((aesKey) => {
+      const iv = crypto.randomBytes(16);
 
-  const key = crypto.generateKeySync('aes', { length: 192 });
-  const cipher = crypto.createCipheriv(
-    'aes-192-gcm',
-    key,
-    initializationVector
-  );
+      const cipher = crypto.createCipheriv('aes-128-gcm', aesKey, iv);
+      const encryptedMessage = cipher.update(
+        fs.readFileSync(VERIFICATION_RESULT_FILENAME)
+      );
+      cipher.final();
+      const authTag = cipher.getAuthTag();
 
-  // Encrypt message (verification result) with cipher
-  const verificationResult = fs.readFileSync(VERIFICATION_RESULT_FILENAME);
-  const encryptedVerificationResult = cipher.update(verificationResult);
-  fs.writeFileSync(
-    RECEIVED_ROOT + 'encryptedVerificationResult.bin',
-    encryptedVerificationResult
-  );
+      const x509 = new crypto.X509Certificate(
+        fs.readFileSync(CERTIFICATE_PATH)
+      );
 
-  // Encrypt cipher with client's public key
-  const publicKey = crypto.createPublicKey(fs.readFileSync(PUBLIC_KEY_PATH));
-  // const encryptedCipher = crypto.publicEncrypt(publicKey, cipher.final());
-  const encryptedKey = crypto.publicEncrypt(publicKey, key.export());
-  // fs.writeFileSync(RECEIVED_ROOT + 'encryptedCipher.bin', encryptedCipher);
-  fs.writeFileSync(RECEIVED_ROOT + 'encryptedKey.bin', encryptedKey);
+      const aesKeyEncrypted = crypto.publicEncrypt(
+        x509.publicKey,
+        aesKey.export()
+      );
 
-  // Send encrypted cipher and message (verification result) to client
-  writeHeader(socket, createHeader(encryptedKey, encryptedVerificationResult));
-  writePayload(
-    socket,
-    createPayload(encryptedKey, encryptedVerificationResult)
-  );
+      writeHeader(
+        socket,
+        createHeader(encryptedMessage, aesKeyEncrypted, authTag, iv)
+      );
+      writePayload(
+        socket,
+        createPayload(encryptedMessage, aesKeyEncrypted, authTag, iv)
+      );
+    });
 }
 
-function createHeader(encryptedKey, encryptedVerificationResult) {
-  // HEADER:
-  // 1. Encrypted cipher bytes - UInt16(1)
-  // 2. Encrypted verification result bytes - UInt16(1)
+/**
+ * Response Header:
+ * 1. Encrypted message bytes - UInt8(1)
+ * 2. Encrypted AES key bytes - UInt16(1)
+ * 3. authTag bytes - UInt8(1)
+ * 4. IV bytes - UInt8(1)
+ * @param {Buffer} encyptedMessage
+ * @param {Buffer} encryptedAesKey
+ * @param {Buffer} authTag
+ * @param {Buffer} iv
+ * @returns encryptedMessageBytes, encryptedAesKeyBytes, authTagBytes, ivBytes
+ */
+function createHeader(encyptedMessage, encryptedAesKey, authTag, iv) {
+  const encryptedMessageBytes = Buffer.alloc(1);
+  encryptedMessageBytes.writeUInt8(encyptedMessage.byteLength);
+  const encryptedAesKeyBytes = Buffer.alloc(2);
+  encryptedAesKeyBytes.writeUInt16LE(encryptedAesKey.byteLength);
+  const authTagBytes = Buffer.alloc(1);
+  authTagBytes.writeUInt8(authTag.byteLength);
+  const ivBytes = Buffer.alloc(1);
+  ivBytes.writeUInt8(iv.byteLength);
 
-  const cipherBytes = Buffer.alloc(2);
-  cipherBytes.writeUInt16LE(encryptedKey.byteLength);
-  const resultBytes = Buffer.alloc(2);
-  resultBytes.writeUInt16LE(encryptedVerificationResult.byteLength);
-
-  return { cipherBytes, resultBytes };
+  return { encryptedMessageBytes, encryptedAesKeyBytes, authTagBytes, ivBytes };
 }
 
-function createPayload(encryptedCipher, encryptedVerificationResult) {
-  // PAYLOAD (streams):
-  // 3. Encrypted cipher
-  // 4. Encrypted verification result
+/**
+ * Response Payload (streams):
+ * 5. Encrypted message
+ * 6. Encrypted AES key
+ * 7. authTag
+ * 8. IV
+ * @param {Buffer} encyptedMessage
+ * @param {Buffer} encryptedAesKey
+ * @param {Buffer} authTag
+ * @param {Buffer} iv
+ * @returns streams: [encryptedMessageStream, encryptedAesKeyStream, authTagStream, ivStream]
+ */
+function createPayload(encyptedMessage, encryptedAesKey, authTag, iv) {
+  const encryptedMessageStream = Readable.from(encyptedMessage);
+  const encryptedAesKeyStream = Readable.from(encryptedAesKey);
+  const authTagStream = Readable.from(authTag);
+  const ivStream = Readable.from(iv);
 
-  const cipherStream = Readable.from(encryptedCipher);
-  const resultStream = Readable.from(encryptedVerificationResult);
-
-  return { files: [cipherStream, resultStream] };
+  return {
+    streams: [
+      encryptedMessageStream,
+      encryptedAesKeyStream,
+      authTagStream,
+      ivStream,
+    ],
+  };
 }
 
 function writeHeader(socket, header) {
-  socket.write(header.cipherBytes);
-  socket.write(header.resultBytes);
+  socket.write(header.encryptedMessageBytes);
+  socket.write(header.encryptedAesKeyBytes);
+  socket.write(header.authTagBytes);
+  socket.write(header.ivBytes);
 }
 
 function writePayload(socket, payload) {
-  new MultiStream(payload.files).pipe(socket);
+  new MultiStream(payload.streams).pipe(socket);
 }
