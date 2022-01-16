@@ -4,7 +4,7 @@ Signature is VALID.
 
 Author details:
 
-Organization name: Mirna
+Organization name: Mirna Pibernik
 Email/common name: mpiberni1@tvz.hr
 Country: HR
 City: Zagreb

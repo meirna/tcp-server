@@ -1,1 +1,1 @@
-This directory stores received files.
+Directory for received files.
