@@ -3,17 +3,17 @@ const util = require('util');
 const crypto = require('crypto');
 const { Readable } = require('stream');
 const { Socket } = require('net');
+const http = require('http');
 const x509parse = require('x509.js');
 const MultiStream = require('multistream');
 
 const RECEIVED_ROOT = './_RECEIVED/';
 const SIGNATURE_FILENAME_APPEND = '_signature.bin';
 const VERIFICATION_RESULT_FILENAME = 'verification-result.txt';
-const CERTIFICATE_PATH = './my-certificate.cert';
 
 module.exports = {
   processRequest: processRequest,
-  sendResponse: sendResponse,
+  processResponse: processResponse,
 };
 
 /**
@@ -21,13 +21,15 @@ module.exports = {
  * 1. Signature bytes - UInt16(1) - 2 bytes - offset 0
  * 2. Document bytes - UInt32(1) - 4 bytes - offset 2
  * 3. Document filename bytes - UInt16(1) - 2 bytes - offset 6
+ * 4. JWT bytes - UInt16(1) - 2 bytes - offset 8
  *
  * Request Payload (streams):
- * 4. Document filename
- * 5. Signature
- * 6. Document
+ * 5. Document filename
+ * 6. Signature
+ * 7. Document
+ * 8. JWT
  * @param {Buffer[]} body
- * @returns documentFilename
+ * @returns jwt, documentFilename
  */
 function parseRequest(body) {
   const received = Buffer.concat(body);
@@ -35,13 +37,15 @@ function parseRequest(body) {
   const signatureBytesOffset = 0;
   const documentBytesOffset = 2;
   const documentFilenameBytesOffset = 6;
-  const documentFilenameOffset = 8;
+  const jwtBytesOffset = 8;
+  const documentFilenameOffset = 10;
 
   const signatureBytes = received.readUInt16LE(signatureBytesOffset);
   const documentBytes = received.readUInt32LE(documentBytesOffset);
   const documentFilenameBytes = received.readUInt16LE(
     documentFilenameBytesOffset
   );
+  const jwtBytes = received.readUInt16LE(jwtBytesOffset);
 
   const documentFilename = received
     .slice(
@@ -54,8 +58,20 @@ function parseRequest(body) {
     documentFilenameOffset + documentFilenameBytes + signatureBytes
   );
   const document = received.slice(
-    documentFilenameOffset + documentFilenameBytes + signatureBytes
+    documentFilenameOffset + documentFilenameBytes + signatureBytes,
+    documentFilenameOffset +
+      documentFilenameBytes +
+      signatureBytes +
+      documentBytes
   );
+  const jwt = received
+    .slice(
+      documentFilenameOffset +
+        documentFilenameBytes +
+        signatureBytes +
+        documentBytes
+    )
+    .toString();
 
   // Write document and signature to files -- for demonstration purposes!
   fs.writeFileSync(
@@ -64,25 +80,52 @@ function parseRequest(body) {
   );
   fs.writeFileSync(RECEIVED_ROOT + documentFilename, document);
 
-  return documentFilename;
+  return { jwt, documentFilename };
 }
 
-function processRequest(body) {
-  const documentFilename = parseRequest(body);
+/**
+ * Gets client's certificate from REST service and verifies document signature
+ * @param {Socket} socket
+ * @param {Buffer[]} body
+ * @param {Function} callback processResponse
+ */
+function processRequest(socket, body, callback) {
+  const { jwt, documentFilename } = parseRequest(body);
 
-  // Parse author's certificate
-  const certificate = fs.readFileSync(CERTIFICATE_PATH);
-  const x509 = new crypto.X509Certificate(certificate);
-  const authorDetails = getCertificateAuthorDetails(certificate);
+  const options = {
+    host: 'localhost',
+    port: 8080,
+    path: '/certificate',
+    headers: { 'x-access-token': jwt },
+  };
 
-  if (verifySignature(documentFilename, x509)) {
-    fs.writeFileSync(
-      VERIFICATION_RESULT_FILENAME,
-      'Signature is VALID.' + authorDetails
-    );
-  } else {
-    fs.writeFileSync(VERIFICATION_RESULT_FILENAME, 'Signature is NOT VALID.');
-  }
+  http
+    .request(options, (res) => {
+      let data = '';
+
+      res.on('data', (chunk) => (data += chunk));
+
+      res.on('end', () => {
+        const certificate = data.replace(/\\r\\n/g, '\r\n').replace(/"/g, '');
+        const x509 = new crypto.X509Certificate(certificate);
+        const authorDetails = getCertificateAuthorDetails(certificate);
+
+        if (verifySignature(documentFilename, x509)) {
+          fs.writeFileSync(
+            VERIFICATION_RESULT_FILENAME,
+            'Signature is VALID.' + authorDetails
+          );
+        } else {
+          fs.writeFileSync(
+            VERIFICATION_RESULT_FILENAME,
+            'Signature is NOT VALID.'
+          );
+        }
+
+        callback(socket, certificate);
+      });
+    })
+    .end();
 }
 
 function getCertificateAuthorDetails(certificate) {
@@ -134,8 +177,9 @@ function verifySignature(documentFilename, x509) {
  * 9. Encrypt AES-128 key with public key
  * 10. Send to client: encryptedMessage, authTag, encrypted AES-128 key, IV
  * @param {Socket} socket
+ * @param {string} certificate
  */
-function sendResponse(socket) {
+function processResponse(socket, certificate) {
   util
     .promisify(crypto.generateKey)('aes', { length: 128 })
     .then((aesKey) => {
@@ -148,9 +192,7 @@ function sendResponse(socket) {
       cipher.final();
       const authTag = cipher.getAuthTag();
 
-      const x509 = new crypto.X509Certificate(
-        fs.readFileSync(CERTIFICATE_PATH)
-      );
+      const x509 = new crypto.X509Certificate(certificate);
 
       const aesKeyEncrypted = crypto.publicEncrypt(
         x509.publicKey,

@@ -19,9 +19,7 @@ server.on('connection', (socket) => {
   });
 
   socket.on('end', () => {
-    service.processRequest(requestBody);
-
-    service.sendResponse(socket);
+    service.processRequest(socket, requestBody, service.processResponse);
 
     disconnect(socket);
   });
