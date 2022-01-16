@@ -106,7 +106,7 @@ function processRequest(socket, body, callback) {
       res.on('data', (chunk) => (data += chunk));
 
       res.on('end', () => {
-        const certificate = data.replace(/\\r\\n/g, '\r\n').replace(/"/g, '');
+        const certificate = data.replace(/\\n/g, '\r\n').replace(/"/g, '');
         const x509 = new crypto.X509Certificate(certificate);
         const authorDetails = getCertificateAuthorDetails(certificate);
 
