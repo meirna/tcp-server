@@ -31,7 +31,7 @@ module.exports = {
  * @param {Buffer[]} body
  * @returns jwt, documentFilename
  */
-function parseRequest(body) {
+async function parseRequest(body) {
   const received = Buffer.concat(body);
 
   const signatureBytesOffset = 0;
@@ -74,11 +74,14 @@ function parseRequest(body) {
     .toString();
 
   // Write document and signature to files -- for demonstration purposes!
-  fs.writeFileSync(
-    RECEIVED_ROOT + documentFilename + SIGNATURE_FILENAME_APPEND,
+  await util.promisify(fs.writeFile)(
+    `${RECEIVED_ROOT}${documentFilename}${SIGNATURE_FILENAME_APPEND}`,
     signature
   );
-  fs.writeFileSync(RECEIVED_ROOT + documentFilename, document);
+  await util.promisify(fs.writeFile)(
+    `${RECEIVED_ROOT}${documentFilename}`,
+    document
+  );
 
   return { jwt, documentFilename };
 }
@@ -89,42 +92,43 @@ function parseRequest(body) {
  * @param {Buffer[]} body
  * @param {Function} callback processResponse
  */
-function processRequest(socket, body, callback) {
-  const { jwt, documentFilename } = parseRequest(body);
-
-  const options = {
-    host: 'localhost',
-    port: 8080,
-    path: '/certificate',
-    headers: { 'x-access-token': jwt },
-  };
+async function processRequest(socket, body, callback) {
+  const { jwt, documentFilename } = await parseRequest(body);
 
   http
-    .request(options, (res) => {
-      let data = '';
+    .request(
+      {
+        host: 'localhost',
+        port: 8080,
+        path: '/certificate',
+        headers: { 'x-access-token': jwt },
+      },
+      (res) => {
+        let data = '';
 
-      res.on('data', (chunk) => (data += chunk));
+        res.on('data', (chunk) => (data += chunk));
 
-      res.on('end', () => {
-        const certificate = data.replace(/\\n/g, '\r\n').replace(/"/g, '');
-        const x509 = new crypto.X509Certificate(certificate);
-        const authorDetails = getCertificateAuthorDetails(certificate);
+        res.on('end', async () => {
+          const certificate = data.replace(/\\n/g, '\r\n').replace(/"/g, '');
+          const x509 = new crypto.X509Certificate(certificate);
+          const authorDetails = getCertificateAuthorDetails(certificate);
 
-        if (verifySignature(documentFilename, x509)) {
-          fs.writeFileSync(
-            VERIFICATION_RESULT_FILENAME,
-            'Signature is VALID.' + authorDetails
-          );
-        } else {
-          fs.writeFileSync(
-            VERIFICATION_RESULT_FILENAME,
-            'Signature is NOT VALID.'
-          );
-        }
+          if (await verifySignature(documentFilename, x509.publicKey)) {
+            await util.promisify(fs.writeFile)(
+              VERIFICATION_RESULT_FILENAME,
+              `Signature is VALID. ${authorDetails}`
+            );
+          } else {
+            await util.promisify(fs.writeFile)(
+              VERIFICATION_RESULT_FILENAME,
+              'Signature is NOT VALID.'
+            );
+          }
 
-        callback(socket, certificate);
-      });
-    })
+          callback(socket, x509.publicKey);
+        });
+      }
+    )
     .end();
 }
 
@@ -148,17 +152,21 @@ function getCertificateAuthorDetails(certificate) {
   );
 }
 
-function verifySignature(documentFilename, x509) {
+async function verifySignature(documentFilename, publicKey) {
   // Calculate document hash
-  const document = fs.readFileSync(RECEIVED_ROOT + documentFilename);
-  const hash = crypto.createHash('sha512');
+  const document = await util.promisify(fs.readFile)(
+    `${RECEIVED_ROOT}${documentFilename}`
+  );
+  const hash = crypto.createHash('SHA512');
   hash.update(document);
 
   // Decrypt signature with author's public key obtained from certificate
-  const signature = fs.readFileSync(
-    RECEIVED_ROOT + documentFilename + SIGNATURE_FILENAME_APPEND
+  const decryptedSignature = crypto.publicDecrypt(
+    publicKey,
+    await util.promisify(fs.readFile)(
+      `${RECEIVED_ROOT}${documentFilename}${SIGNATURE_FILENAME_APPEND}`
+    )
   );
-  const decryptedSignature = crypto.publicDecrypt(x509.publicKey, signature);
 
   // Verify document hash equals decryped signature
   return decryptedSignature.compare(hash.digest()) == 0;
@@ -169,7 +177,7 @@ function verifySignature(documentFilename, x509) {
  * 1. Generate AES-128 key
  * 2. Export AES-128 key
  * 3. Create IV (randomBytes(16))
- * 4. Create cipher with AES-128 key+IV
+ * 4. Create cipher with AES-128 key + IV
  * 5. encryptedMessage = cipher.update(message)
  * 6. cipher.final()
  * 7. Get authTag from finalized cipher
@@ -177,37 +185,29 @@ function verifySignature(documentFilename, x509) {
  * 9. Encrypt AES-128 key with public key
  * 10. Send to client: encryptedMessage, authTag, encrypted AES-128 key, IV
  * @param {Socket} socket
- * @param {string} certificate
+ * @param {crypto.KeyObject} publicKey
  */
-function processResponse(socket, certificate) {
-  util
-    .promisify(crypto.generateKey)('aes', { length: 128 })
-    .then((aesKey) => {
-      const iv = crypto.randomBytes(16);
+async function processResponse(socket, publicKey) {
+  const aesKey = await util.promisify(crypto.generateKey)('aes', {
+    length: 128,
+  });
+  const iv = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv('aes-128-gcm', aesKey, iv);
+  const encryptedMessage = cipher.update(
+    await util.promisify(fs.readFile)(VERIFICATION_RESULT_FILENAME)
+  );
+  cipher.final();
+  const authTag = cipher.getAuthTag();
+  const aesKeyEncrypted = crypto.publicEncrypt(publicKey, aesKey.export());
 
-      const cipher = crypto.createCipheriv('aes-128-gcm', aesKey, iv);
-      const encryptedMessage = cipher.update(
-        fs.readFileSync(VERIFICATION_RESULT_FILENAME)
-      );
-      cipher.final();
-      const authTag = cipher.getAuthTag();
-
-      const x509 = new crypto.X509Certificate(certificate);
-
-      const aesKeyEncrypted = crypto.publicEncrypt(
-        x509.publicKey,
-        aesKey.export()
-      );
-
-      writeHeader(
-        socket,
-        createHeader(encryptedMessage, aesKeyEncrypted, authTag, iv)
-      );
-      writePayload(
-        socket,
-        createPayload(encryptedMessage, aesKeyEncrypted, authTag, iv)
-      );
-    });
+  writeHeader(
+    socket,
+    createHeader(encryptedMessage, aesKeyEncrypted, authTag, iv)
+  );
+  writePayload(
+    socket,
+    createPayload(encryptedMessage, aesKeyEncrypted, authTag, iv)
+  );
 }
 
 /**
@@ -248,17 +248,12 @@ function createHeader(encyptedMessage, encryptedAesKey, authTag, iv) {
  * @returns streams: [encryptedMessageStream, encryptedAesKeyStream, authTagStream, ivStream]
  */
 function createPayload(encyptedMessage, encryptedAesKey, authTag, iv) {
-  const encryptedMessageStream = Readable.from(encyptedMessage);
-  const encryptedAesKeyStream = Readable.from(encryptedAesKey);
-  const authTagStream = Readable.from(authTag);
-  const ivStream = Readable.from(iv);
-
   return {
     streams: [
-      encryptedMessageStream,
-      encryptedAesKeyStream,
-      authTagStream,
-      ivStream,
+      Readable.from(encyptedMessage),
+      Readable.from(encryptedAesKey),
+      Readable.from(authTag),
+      Readable.from(iv),
     ],
   };
 }
