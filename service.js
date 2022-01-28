@@ -13,7 +13,6 @@ const VERIFICATION_RESULT_FILENAME = 'verification-result.txt';
 
 module.exports = {
   processRequest: processRequest,
-  processResponse: processResponse,
 };
 
 /**
@@ -125,7 +124,7 @@ async function processRequest(socket, body, callback) {
             );
           }
 
-          callback(socket, x509.publicKey);
+          await processResponse(socket, x509.publicKey);
         });
       }
     )

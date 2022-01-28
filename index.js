@@ -18,7 +18,7 @@ server
     });
 
     socket.on('end', () => {
-      service.processRequest(socket, requestBody, service.processResponse);
+      service.processRequest(socket, requestBody);
       disconnect(socket);
     });
   })
